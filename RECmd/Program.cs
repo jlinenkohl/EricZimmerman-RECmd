@@ -203,6 +203,17 @@ internal class Program
             Description = "When true, allow transaction log files to not exist for dirty hives",
             DefaultValueFactory = _ => false
         };
+
+        var integrityOpt = new Option<bool>("--integrity")
+        {
+            Description = "When true, run a best-effort integrity check and continue parsing when corruption is found",
+            DefaultValueFactory = _ => false
+        };
+
+        var integrityLogOpt = new Option<string>("--integrityLog")
+        {
+            Description = "Path to write corruption details when --integrity is enabled"
+        };
         
         var debugOpt = new Option<bool>("--debug")
         {
@@ -325,6 +336,8 @@ internal class Program
           regexOpt,
           dtOpt,
           nlOpt,
+          integrityOpt,
+          integrityLogOpt,
           recoverOpt,
           vssOpt,
           dedupeOpt,
@@ -337,7 +350,7 @@ internal class Program
             result.GetValue(vnOpt), result.GetValue(bnOpt), result.GetValue(csvOpt), result.GetValue(csvfOpt),
             result.GetValue(saveToOpt),result.GetValue(jsonOpt),result.GetValue(jsonfOpt),result.GetValue(detailsOpt),result.GetValue(base64Opt),
             result.GetValue(minSizeOpt),result.GetValue(saOpt),result.GetValue(skOpt),result.GetValue(svOpt),result.GetValue(sdOpt),result.GetValue(ssOpt),result.GetValue(literalOpt),
-            result.GetValue(ndOpt),result.GetValue(regexOpt),result.GetValue(dtOpt),result.GetValue(nlOpt),result.GetValue(recoverOpt),result.GetValue(vssOpt),result.GetValue(dedupeOpt),
+            result.GetValue(ndOpt),result.GetValue(regexOpt),result.GetValue(dtOpt),result.GetValue(nlOpt),result.GetValue(integrityOpt),result.GetValue(integrityLogOpt),result.GetValue(recoverOpt),result.GetValue(vssOpt),result.GetValue(dedupeOpt),
             result.GetValue(syncOpt),result.GetValue(debugOpt),result.GetValue(traceOpt)));
             
         var foo = _rootCommand.Parse(args).InvokeAsync();
@@ -402,7 +415,67 @@ internal class Program
     }
 #endif
     
-    private static void DoWork(string d, string f, string kn, string vn, string bn, string csv, string csvf, string saveTo, string json, string jsonf, bool details, int base64, int minSize, string sa, string sk, string sv, string sd, string ss, bool literal, bool nd, bool regex, string dt, bool nl, bool recover, bool vss, bool dedupe, bool sync, bool debug, bool trace)
+    private static bool ConfigureIntegrityMode(bool integrity, string integrityLog)
+    {
+        if (integrity == false)
+        {
+            return false;
+        }
+
+        try
+        {
+            var settingsType = Type.GetType("Registry.RegistryParseSettings, Registry");
+            if (settingsType == null)
+            {
+                Log.Warning("Integrity mode requested, but RegistryParseSettings was not found in the loaded Registry library");
+                return false;
+            }
+
+            settingsType.GetProperty("ContinueOnCorruption", BindingFlags.Public | BindingFlags.Static)?.SetValue(null, true);
+
+            var logPathProp = settingsType.GetProperty("CorruptionLogPath", BindingFlags.Public | BindingFlags.Static);
+            if (logPathProp != null)
+            {
+                if (integrityLog.IsNullOrEmpty() == false)
+                {
+                    logPathProp.SetValue(null, integrityLog);
+                }
+
+                var configuredPath = logPathProp.GetValue(null)?.ToString();
+                if (configuredPath.IsNullOrEmpty() == false)
+                {
+                    Log.Information("Integrity corruption details will be written to {ConfiguredPath}", configuredPath);
+                }
+            }
+
+            Log.Information("Integrity mode enabled (continue on corruption)");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "Unable to configure integrity mode. Continuing with normal parser behavior");
+            return false;
+        }
+    }
+
+    private static void LogIntegritySummary(RegistryHive reg, string hiveToProcess)
+    {
+        try
+        {
+            var hardErrors = reg.GetType().GetProperty("HardParsingErrors")?.GetValue(reg);
+            var softErrors = reg.GetType().GetProperty("SoftParsingErrors")?.GetValue(reg);
+
+            Log.Information(
+                "Integrity summary for {HiveToProcess}: Hard parsing errors={HardErrors}, Soft parsing errors={SoftErrors}",
+                hiveToProcess, hardErrors ?? "n/a", softErrors ?? "n/a");
+        }
+        catch (Exception ex)
+        {
+            Log.Debug(ex, "Unable to read integrity summary counters for {HiveToProcess}", hiveToProcess);
+        }
+    }
+
+    private static void DoWork(string d, string f, string kn, string vn, string bn, string csv, string csvf, string saveTo, string json, string jsonf, bool details, int base64, int minSize, string sa, string sk, string sv, string sd, string ss, bool literal, bool nd, bool regex, string dt, bool nl, bool integrity, string integrityLog, bool recover, bool vss, bool dedupe, bool sync, bool debug, bool trace)
     {
         var levelSwitch = new LoggingLevelSwitch();
 
@@ -842,6 +915,8 @@ internal class Program
 
         LoadPlugins();
 
+        ConfigureIntegrityMode(integrity, integrityLog);
+
         var hiveInfoWithHits = new List<string>();
 
         foreach (var hiveToProcess in hivesToProcess)
@@ -960,7 +1035,7 @@ internal class Program
 
                     if (logFiles.Length == 0)
                     {
-                        if (nl == false)
+                        if (nl == false && integrity == false)
                         {
                             Log.Warning(
                                 "Registry hive is dirty and no transaction logs were found in the same directory! LOGs should have same base name as the hive. Aborting!!");
@@ -992,8 +1067,13 @@ internal class Program
                             }
                     }
                 }
-                
+
                 reg.ParseHive();
+
+                if (integrity)
+                {
+                    LogIntegritySummary(reg, hiveToProcess);
+                }
                 
                 Console.WriteLine();
 
@@ -1679,7 +1759,11 @@ internal class Program
             }
             catch (Exception ex)
             {
-                if (ex.Message.Contains("Sequence numbers do not match and transaction") == false)
+                if (integrity && ex.Message.Contains("Sequence numbers do not match and transaction"))
+                {
+                    Log.Warning("Integrity mode enabled: continuing after dirty hive transaction log mismatch in {HiveToProcess}", hiveToProcess);
+                }
+                else if (ex.Message.Contains("Sequence numbers do not match and transaction") == false)
                 {
                     if (ex.Message.Contains("Administrator privileges not found"))
                     {
