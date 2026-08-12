@@ -214,6 +214,12 @@ internal class Program
         {
             Description = "Path to write corruption details when --integrity is enabled"
         };
+
+        var exceeds2GbRecoveryOpt = new Option<bool>("--exceeds2GbRecovery")
+        {
+            Description = "Enable stream-backed recovery mode for oversized/truncated hives (requires Registry support)",
+            DefaultValueFactory = _ => false
+        };
         
         var debugOpt = new Option<bool>("--debug")
         {
@@ -338,6 +344,7 @@ internal class Program
           nlOpt,
           integrityOpt,
           integrityLogOpt,
+          exceeds2GbRecoveryOpt,
           recoverOpt,
           vssOpt,
           dedupeOpt,
@@ -350,7 +357,7 @@ internal class Program
             result.GetValue(vnOpt), result.GetValue(bnOpt), result.GetValue(csvOpt), result.GetValue(csvfOpt),
             result.GetValue(saveToOpt),result.GetValue(jsonOpt),result.GetValue(jsonfOpt),result.GetValue(detailsOpt),result.GetValue(base64Opt),
             result.GetValue(minSizeOpt),result.GetValue(saOpt),result.GetValue(skOpt),result.GetValue(svOpt),result.GetValue(sdOpt),result.GetValue(ssOpt),result.GetValue(literalOpt),
-            result.GetValue(ndOpt),result.GetValue(regexOpt),result.GetValue(dtOpt),result.GetValue(nlOpt),result.GetValue(integrityOpt),result.GetValue(integrityLogOpt),result.GetValue(recoverOpt),result.GetValue(vssOpt),result.GetValue(dedupeOpt),
+            result.GetValue(ndOpt),result.GetValue(regexOpt),result.GetValue(dtOpt),result.GetValue(nlOpt),result.GetValue(integrityOpt),result.GetValue(integrityLogOpt),result.GetValue(exceeds2GbRecoveryOpt),result.GetValue(recoverOpt),result.GetValue(vssOpt),result.GetValue(dedupeOpt),
             result.GetValue(syncOpt),result.GetValue(debugOpt),result.GetValue(traceOpt)));
             
         var foo = _rootCommand.Parse(args).InvokeAsync();
@@ -415,9 +422,9 @@ internal class Program
     }
 #endif
     
-    private static bool ConfigureIntegrityMode(bool integrity, string integrityLog)
+    private static bool ConfigureIntegrityMode(bool integrity, string integrityLog, bool exceeds2GbRecovery)
     {
-        if (integrity == false)
+        if (integrity == false && exceeds2GbRecovery == false)
         {
             return false;
         }
@@ -432,6 +439,20 @@ internal class Program
             }
 
             settingsType.GetProperty("ContinueOnCorruption", BindingFlags.Public | BindingFlags.Static)?.SetValue(null, true);
+
+            if (exceeds2GbRecovery)
+            {
+                var exceeds2GbProp = settingsType.GetProperty("Exceeds2GbRecovery", BindingFlags.Public | BindingFlags.Static);
+                if (exceeds2GbProp != null)
+                {
+                    exceeds2GbProp.SetValue(null, true);
+                    Log.Information("Exceeds2GbRecovery mode enabled");
+                }
+                else
+                {
+                    Log.Warning("Exceeds2GbRecovery mode was requested, but Exceeds2GbRecovery was not found in the loaded Registry library");
+                }
+            }
 
             var logPathProp = settingsType.GetProperty("CorruptionLogPath", BindingFlags.Public | BindingFlags.Static);
             if (logPathProp != null)
@@ -448,7 +469,9 @@ internal class Program
                 }
             }
 
-            Log.Information("Integrity mode enabled (continue on corruption)");
+            Log.Information(
+                "Integrity parsing options enabled (ContinueOnCorruption=true, Exceeds2GbRecovery={Exceeds2GbRecovery})",
+                exceeds2GbRecovery);
             return true;
         }
         catch (Exception ex)
@@ -468,6 +491,13 @@ internal class Program
             Log.Information(
                 "Integrity summary for {HiveToProcess}: Hard parsing errors={HardErrors}, Soft parsing errors={SoftErrors}",
                 hiveToProcess, hardErrors ?? "n/a", softErrors ?? "n/a");
+
+            var integrityReport = reg.GetType().GetProperty("IntegrityReport")?.GetValue(reg);
+            if (integrityReport != null)
+            {
+                var issueCount = integrityReport.GetType().GetProperty("IssueCount")?.GetValue(integrityReport);
+                Log.Information("Integrity report for {HiveToProcess}: Issues={IssueCount}", hiveToProcess, issueCount ?? "n/a");
+            }
         }
         catch (Exception ex)
         {
@@ -475,7 +505,7 @@ internal class Program
         }
     }
 
-    private static void DoWork(string d, string f, string kn, string vn, string bn, string csv, string csvf, string saveTo, string json, string jsonf, bool details, int base64, int minSize, string sa, string sk, string sv, string sd, string ss, bool literal, bool nd, bool regex, string dt, bool nl, bool integrity, string integrityLog, bool recover, bool vss, bool dedupe, bool sync, bool debug, bool trace)
+    private static void DoWork(string d, string f, string kn, string vn, string bn, string csv, string csvf, string saveTo, string json, string jsonf, bool details, int base64, int minSize, string sa, string sk, string sv, string sd, string ss, bool literal, bool nd, bool regex, string dt, bool nl, bool integrity, string integrityLog, bool exceeds2GbRecovery, bool recover, bool vss, bool dedupe, bool sync, bool debug, bool trace)
     {
         var levelSwitch = new LoggingLevelSwitch();
 
@@ -915,7 +945,7 @@ internal class Program
 
         LoadPlugins();
 
-        ConfigureIntegrityMode(integrity, integrityLog);
+        ConfigureIntegrityMode(integrity, integrityLog, exceeds2GbRecovery);
 
         var hiveInfoWithHits = new List<string>();
 
@@ -1035,7 +1065,7 @@ internal class Program
 
                     if (logFiles.Length == 0)
                     {
-                        if (nl == false && integrity == false)
+                        if (nl == false && integrity == false && exceeds2GbRecovery == false)
                         {
                             Log.Warning(
                                 "Registry hive is dirty and no transaction logs were found in the same directory! LOGs should have same base name as the hive. Aborting!!");
@@ -1070,7 +1100,7 @@ internal class Program
 
                 reg.ParseHive();
 
-                if (integrity)
+                if (integrity || exceeds2GbRecovery)
                 {
                     LogIntegritySummary(reg, hiveToProcess);
                 }
@@ -1759,7 +1789,7 @@ internal class Program
             }
             catch (Exception ex)
             {
-                if (integrity && ex.Message.Contains("Sequence numbers do not match and transaction"))
+                if ((integrity || exceeds2GbRecovery) && ex.Message.Contains("Sequence numbers do not match and transaction"))
                 {
                     Log.Warning("Integrity mode enabled: continuing after dirty hive transaction log mismatch in {HiveToProcess}", hiveToProcess);
                 }

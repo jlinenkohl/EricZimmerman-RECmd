@@ -45,6 +45,7 @@
             nl              When true, ignore transaction log files for dirty hives. Default is FALSE
             integrity       When true, run best-effort integrity parsing and continue on supported corruption conditions
             integrityLog    Path to write corruption details when --integrity is enabled
+            exceeds2GbRecovery  Enable stream-backed recovery mode for oversized/truncated hives when supported
             recover         If true, recover deleted keys/values. Default is TRUE
 
             vss             Process all Volume Shadow Copies that exist on drive specified by -f or -d . Default is FALSE
